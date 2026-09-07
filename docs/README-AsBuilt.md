@@ -42,7 +42,7 @@ New-AsBuiltReport `
   -Credential $cred `
   -Format Html,Word `
   -OutputFolderPath "$HOME/AsBuiltReports" `
-  -StyleFilePath "$HOME/AsBuiltReports/e360.Style.ps1" `    # e360 branding (see note)
+  -StyleFilePath "$HOME/AsBuiltReports/<Company>.Style.ps1" `    # optional company branding (see note)
   -EnableHealthCheck -Verbose
 ```
 
@@ -52,7 +52,7 @@ Replace `10.0.0.10` with your cluster management LIF / FQDN.
 
 - Works on macOS with a recent NetApp.ONTAP (9.11+). If import fails, update the
   toolkit: `Update-Module NetApp.ONTAP`.
-- **e360 logo / branding:** `-StyleFilePath` points to `e360.Style.ps1` (pending
+- **Company logo / branding:** `-StyleFilePath` points to `<Company>.Style.ps1` (pending
   the logo template). Cover-image embedding uses `System.Drawing` (Windows-only),
   so the logo renders reliably only when generated on Windows. Remove the
   `-StyleFilePath` line until the style script exists.
