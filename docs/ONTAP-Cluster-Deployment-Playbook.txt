@@ -1,0 +1,811 @@
+###############################################################################
+# ONTAP Cluster Deployment Playbook (CLI, copy/paste)
+# Repo    : netapp-ontap-powershell
+# Target  : NetApp AFF / ASA (A70-class), ONTAP 9.13+
+# Scope   : Single cluster, Day-1 build, peer-capable (intercluster LIFs;
+#           cluster peer NOT formed)
+# Author  : HumbledGeeks / Allen Johnson
+# Version : 1.0
+###############################################################################
+#
+# WHAT THIS PERFORMS
+# ------------------
+# This playbook walks a two-node ONTAP cluster from first console access
+# through accepted handoff. It produces:
+#   * Hardened cluster baseline (NTP, DNS, banner)
+#   * Security baseline (OKM, AD-integrated admin auth + break-glass local,
+#     insecure protocols disabled, hardened SSH ciphers)
+#   * Network layer 2 with LACP, VLAN tagging, MTU 9000 on storage BCs,
+#     failover groups per protocol
+#   * Aggregates (ADPv2 verified) and HA enabled
+#   * Two SVMs (names are configurable via <NAS_SVM> and <SAN_SVM>):
+#       - <NAS_SVM> : NFSv3 + NFSv4.1 and SMB/CIFS
+#                     (AD-joined, signing + encryption, ABE)
+#       - <SAN_SVM> : iSCSI (CHAP) and FCP
+#     (NAS and SAN are intentionally separated per repo CLAUDE.md.)
+#   * Data LIFs per SVM/protocol with correct service-policies
+#   * Intercluster LIFs ready for future SnapMirror peering
+#   * Acceptance tests (HA takeover/giveback, LIF failover, snapshot, ASUP)
+#   * Monitoring wiring (AutoSupport HTTPS, AIQUM, syslog, SNMPv3, EMS)
+#   * Handoff evidence (config backup + show output bundle)
+#
+# OUT OF SCOPE: SnapMirror policy/relationship config, host-side mount/
+# connect, application onboarding.
+#
+# HOW TO USE
+# ----------
+# 1. Open this file alongside your site worksheet (IPs, VLANs, node names,
+#    AD domain, etc.).
+# 2. Do a find-and-replace on every <PLACEHOLDER> below for your site.
+#    Placeholders use UPPER_SNAKE_CASE inside angle brackets.
+# 3. Work top-to-bottom, one phase at a time. Stop at each "# VERIFY:" line
+#    and confirm output before proceeding.
+# 4. NEVER paste secrets into this file. Passphrases and AD credentials are
+#    shown as <PROMPTED_AT_RUNTIME> and entered at the cluster's prompt.
+# 5. Lines starting with "#" are comments. Lines starting with "##" are
+#    section dividers. Lines starting with "###" mark a new phase.
+#
+# PLACEHOLDER LEGEND (most common)
+# --------------------------------
+#   <CLUSTER_NAME>            cluster shortname (e.g. cluster)
+#   <CLUSTER_FQDN>            cluster mgmt FQDN (e.g. example-cluster.example.com)
+#   <CLUSTER_MGMT_IP/MASK/GW> cluster mgmt LIF address
+#   <NODE1_NAME> <NODE2_NAME> node shortnames (e.g. example-cluster-01/-02)
+#   <NODE1_MGMT_IP> etc.      node mgmt LIF addresses
+#   <SP1_IP> <SP2_IP>         Service Processor addresses
+#   <MGMT_VLAN_ID>            cluster mgmt VLAN tag
+#   <ICL_VLAN_ID>             intercluster VLAN tag (separate from mgmt)
+#   <NAS_VLAN_ID>             NFS+SMB data VLAN tag
+#   <SAN_VLAN_ID>             iSCSI data VLAN tag
+#   <PORT_A> <PORT_B> ...     physical data ports (e.g. e2a, e2b, e2c, e2d)
+#   <NAS_SVM>                 SVM serving NFS + CIFS    (suggested name: svm-nas)
+#   <SAN_SVM>                 SVM serving iSCSI + FCP   (suggested name: svm-san)
+#   <AD_DOMAIN>               AD DNS domain (e.g. example.com)
+#   <AD_OU>                   OU DN for SMB server computer object
+#   <AD_ADMIN_GROUP>          AD group mapped to cluster admin role
+#   <AD_RO_GROUP>             AD group mapped to readonly role
+#   <SYSLOG_SERVER>           syslog/SIEM target
+#   <NTP_SERVER_1/2>          NTP sources
+#   <DNS_SERVER_1/2>          DNS resolvers
+#   <CIDR_CLIENTS>            allowed NFS client CIDR (NOT 0.0.0.0/0)
+#
+# NOTE on LIF names: data-LIF names follow a fixed convention
+#   n<N>_<proto>_lif<NN>      e.g. n1_nfs_lif01, n2_cifs_lif02
+# so they are not parameterized -- each LIF has a unique, self-describing
+# name. If you change <NAS_SVM>/<SAN_SVM>, the LIF names do NOT change.
+#
+###############################################################################
+
+
+### Phase 0 -- Pre-deployment checklist (off-array; no CLI required)
+##############################################################################
+# Complete BEFORE the cluster setup wizard. No commands here; verify each
+# item and check it off.
+#
+#   [ ] Hardware racked, powered, cabled per topology drawing
+#   [ ] All disks present and same firmware level
+#   [ ] Site worksheet complete (cluster + node + LIF IPs, VLANs, DNS, NTP)
+#   [ ] DNS A/PTR records pre-created for <CLUSTER_FQDN>, <NODE*_FQDN>
+#   [ ] AD service account ready (rights to join SMB server in <AD_OU>)
+#   [ ] Network end-to-end supports MTU 9216 (storage data uses jumbo frames at MTU 9000)
+#   [ ] CA available to sign the cluster mgmt cert
+#   [ ] Syslog/SIEM endpoint reachable from cluster mgmt
+#   [ ] AIQUM (Active IQ Unified Manager) instance reachable
+#   [ ] Validate hardware + ONTAP version against NetApp IMT
+#         https://imt.netapp.com
+#   [ ] Console access (serial or SP IPMI) to <NODE1_NAME>
+
+
+### Phase 1 -- Cluster create + baseline services
+##############################################################################
+# Run the interactive 'cluster setup' wizard on <NODE1_NAME> at the console
+# first; then join <NODE2_NAME>. The commands below are the POST-WIZARD
+# baseline. The wizard prompts you for:
+#   * Cluster name, cluster mgmt LIF, admin password
+#   * Node mgmt LIFs, node names
+# Use values from the site worksheet. After the wizard, log in as 'admin'
+# from your jump host:
+#   ssh admin@<CLUSTER_MGMT_IP>
+
+### Timezone / NTP / DNS ###
+timezone -timezone <TIMEZONE>                           # e.g. America/Los_Angeles
+cluster time-service ntp server create -server <NTP_SERVER_1> -version auto
+cluster time-service ntp server create -server <NTP_SERVER_2> -version auto
+
+# VERIFY:
+cluster time-service ntp server show
+cluster date show
+
+vserver services name-service dns create -vserver <CLUSTER_NAME> \
+    -domains <AD_DOMAIN> -name-servers <DNS_SERVER_1>,<DNS_SERVER_2> -state enabled
+
+# VERIFY:
+vserver services name-service dns show
+vserver services name-service dns check -vserver <CLUSTER_NAME> -name-server <DNS_SERVER_1>
+
+### Login banner / MOTD ###
+security login banner modify -vserver <CLUSTER_NAME> -message \
+"AUTHORIZED USE ONLY. This system is monitored. Disconnect immediately if you
+are not an authorized user."
+
+security login motd modify -vserver <CLUSTER_NAME> -message \
+"Cluster: <CLUSTER_NAME>  |  Location: <SITE>  |  Owner: <TEAM>"
+
+# VERIFY:
+security login banner show
+security login motd show
+
+
+### Phase 2 -- Security baseline
+##############################################################################
+### Onboard Key Manager (OKM) ###
+# Passphrase is entered at the prompt -- do NOT paste it into this file.
+# Store the passphrase in your enterprise secret vault immediately.
+security key-manager onboard enable
+#   Passphrase: <PROMPTED_AT_RUNTIME>
+#   Re-enter:   <PROMPTED_AT_RUNTIME>
+
+# VERIFY:
+security key-manager onboard show-backup     # save backup to secret vault
+security key-manager key query                # auth keys present
+#
+# ALTERNATIVE (recommended for regulated production): external KMIP
+#   security key-manager external enable -vserver <CLUSTER_NAME> \
+#       -key-servers <KMIP_HOST_1>:5696,<KMIP_HOST_2>:5696 \
+#       -client-cert <CLIENT_CERT_NAME> -server-ca-certs <CA_CERT_NAME>
+
+### Disable insecure protocols / harden SSH ###
+security protocol modify -application telnet -enabled false
+security protocol modify -application rsh    -enabled false
+security ssh modify -vserver <CLUSTER_NAME> \
+    -ciphers aes256-gcm@openssh.com,aes128-gcm@openssh.com,aes256-ctr,aes128-ctr \
+    -key-exchange-algorithms diffie-hellman-group-exchange-sha256,curve25519-sha256 \
+    -mac-algorithms hmac-sha2-512,hmac-sha2-256
+# Disable SNMPv1/v2c (we configure SNMPv3 in Phase 11)
+system snmp community delete -community-name public      # if present
+system snmp community delete -community-name private     # if present
+
+# VERIFY:
+security protocol show
+security ssh show -vserver <CLUSTER_NAME>
+system snmp community show
+
+### Break-glass local admin (long random password; store in secret vault) ###
+security login create -user-or-group-name breakglass -application ssh \
+    -authentication-method password -role admin
+#   Password: <PROMPTED_AT_RUNTIME>
+security login password-policy modify -vserver <CLUSTER_NAME> \
+    -minimum-password-length 16 -minimum-symbol-characters 1 \
+    -minimum-digit-characters 1 -minimum-uppercase-characters 1 \
+    -minimum-lowercase-characters 1 -minimum-age 1
+# Delete the default 'diag' password if it's set / disable unused accounts:
+security login show
+#   Lock or remove any unused 'admin'-named local accounts other than 'admin' itself.
+
+# VERIFY end of Phase 2:
+security login show -vserver <CLUSTER_NAME>
+security key-manager onboard show
+
+
+### Phase 3 -- Service Processor (BMC) network
+##############################################################################
+system service-processor network modify -node <NODE1_NAME> \
+    -address-family IPv4 -enable true \
+    -ip-address <SP1_IP> -netmask <SP_MASK> -gateway <SP_GW>
+system service-processor network modify -node <NODE2_NAME> \
+    -address-family IPv4 -enable true \
+    -ip-address <SP2_IP> -netmask <SP_MASK> -gateway <SP_GW>
+
+# VERIFY:
+system service-processor show -instance
+system service-processor network show
+
+
+### Phase 4 -- Network layer 2 (broadcast domains, ifgrps, VLANs, failover)
+##############################################################################
+### Broadcast domains (MTU 9000 for storage data; 1500 for mgmt/intercluster) ###
+network port broadcast-domain create -ipspace Default \
+    -broadcast-domain mgmt    -mtu 1500
+network port broadcast-domain create -ipspace Default \
+    -broadcast-domain nas     -mtu 9000
+network port broadcast-domain create -ipspace Default \
+    -broadcast-domain san     -mtu 9000
+network port broadcast-domain create -ipspace Default \
+    -broadcast-domain icl     -mtu 1500
+
+### LACP ifgrps, VLANs, port-to-BC assignment, and failover groups ###
+##
+### ============================================================================ ###
+
+### CHOOSE ONE OPTION based on what the customer's switching + cabling allows. ###
+
+### Run ONE option block below. Do not mix. ###
+##
+###   Option A -- ONE ifgrp per node (a0a only) ###
+
+###               Use when the customer only has one set of uplink ports per ###
+
+###               node, or only one LACP group per host is supported by their ###
+
+###               switch fabric. ###
+##
+###   Option B -- TWO ifgrps per node (a0a + a0b)        [PREFERRED] ###
+
+###               Splits uplinks across two LACP groups for redundancy across ###
+
+###               NIC cards / PCIe risers / leaf switches. Requires twice the ###
+
+###               uplink ports and a matching LACP config on the switch side. ###
+
+### ============================================================================ ###
+
+### ===== Option A: ONE ifgrp per node (a0a) ===== ###
+# LACP ifgrp per node -- all uplink ports in a0a
+network port ifgrp create -node <NODE1_NAME> -ifgrp a0a -distr-func ip -mode multimode_lacp
+network port ifgrp create -node <NODE2_NAME> -ifgrp a0a -distr-func ip -mode multimode_lacp
+
+network port ifgrp add-port -node <NODE1_NAME> -ifgrp a0a -port <PORT_A>
+network port ifgrp add-port -node <NODE1_NAME> -ifgrp a0a -port <PORT_B>
+network port ifgrp add-port -node <NODE1_NAME> -ifgrp a0a -port <PORT_C>
+network port ifgrp add-port -node <NODE1_NAME> -ifgrp a0a -port <PORT_D>
+network port ifgrp add-port -node <NODE2_NAME> -ifgrp a0a -port <PORT_A>
+network port ifgrp add-port -node <NODE2_NAME> -ifgrp a0a -port <PORT_B>
+network port ifgrp add-port -node <NODE2_NAME> -ifgrp a0a -port <PORT_C>
+network port ifgrp add-port -node <NODE2_NAME> -ifgrp a0a -port <PORT_D>
+
+# Set MTU on a0a so VLAN children can inherit 9000
+network port modify -node <NODE1_NAME> -port a0a -mtu 9000
+network port modify -node <NODE2_NAME> -port a0a -mtu 9000
+
+# VLAN interfaces on a0a
+vlan create -node <NODE1_NAME> -port a0a -vlan-id <MGMT_VLAN_ID>
+vlan create -node <NODE1_NAME> -port a0a -vlan-id <ICL_VLAN_ID>
+vlan create -node <NODE1_NAME> -port a0a -vlan-id <NAS_VLAN_ID>
+vlan create -node <NODE1_NAME> -port a0a -vlan-id <SAN_VLAN_ID>
+vlan create -node <NODE2_NAME> -port a0a -vlan-id <MGMT_VLAN_ID>
+vlan create -node <NODE2_NAME> -port a0a -vlan-id <ICL_VLAN_ID>
+vlan create -node <NODE2_NAME> -port a0a -vlan-id <NAS_VLAN_ID>
+vlan create -node <NODE2_NAME> -port a0a -vlan-id <SAN_VLAN_ID>
+
+# Assign tagged ports to broadcast domains
+network port broadcast-domain add-ports -ipspace Default -broadcast-domain mgmt \
+    -ports <NODE1_NAME>:a0a-<MGMT_VLAN_ID>,<NODE2_NAME>:a0a-<MGMT_VLAN_ID>
+network port broadcast-domain add-ports -ipspace Default -broadcast-domain icl \
+    -ports <NODE1_NAME>:a0a-<ICL_VLAN_ID>,<NODE2_NAME>:a0a-<ICL_VLAN_ID>
+network port broadcast-domain add-ports -ipspace Default -broadcast-domain nas \
+    -ports <NODE1_NAME>:a0a-<NAS_VLAN_ID>,<NODE2_NAME>:a0a-<NAS_VLAN_ID>
+network port broadcast-domain add-ports -ipspace Default -broadcast-domain san \
+    -ports <NODE1_NAME>:a0a-<SAN_VLAN_ID>,<NODE2_NAME>:a0a-<SAN_VLAN_ID>
+
+# Failover groups (one path per node via a0a)
+network interface failover-groups create -vserver <CLUSTER_NAME> -failover-group fg-mgmt \
+    -targets <NODE1_NAME>:a0a-<MGMT_VLAN_ID>,<NODE2_NAME>:a0a-<MGMT_VLAN_ID>
+network interface failover-groups create -vserver <CLUSTER_NAME> -failover-group fg-icl \
+    -targets <NODE1_NAME>:a0a-<ICL_VLAN_ID>,<NODE2_NAME>:a0a-<ICL_VLAN_ID>
+
+### ===== END Option A ===== ###
+
+### ===== Option B: TWO ifgrps per node (a0a + a0b)  [PREFERRED] ===== ###
+# LACP ifgrps per node -- uplinks split across a0a and a0b for redundancy
+network port ifgrp create -node <NODE1_NAME> -ifgrp a0a -distr-func ip -mode multimode_lacp
+network port ifgrp create -node <NODE1_NAME> -ifgrp a0b -distr-func ip -mode multimode_lacp
+network port ifgrp create -node <NODE2_NAME> -ifgrp a0a -distr-func ip -mode multimode_lacp
+network port ifgrp create -node <NODE2_NAME> -ifgrp a0b -distr-func ip -mode multimode_lacp
+
+network port ifgrp add-port -node <NODE1_NAME> -ifgrp a0a -port <PORT_A>
+network port ifgrp add-port -node <NODE1_NAME> -ifgrp a0a -port <PORT_B>
+network port ifgrp add-port -node <NODE1_NAME> -ifgrp a0b -port <PORT_C>
+network port ifgrp add-port -node <NODE1_NAME> -ifgrp a0b -port <PORT_D>
+network port ifgrp add-port -node <NODE2_NAME> -ifgrp a0a -port <PORT_A>
+network port ifgrp add-port -node <NODE2_NAME> -ifgrp a0a -port <PORT_B>
+network port ifgrp add-port -node <NODE2_NAME> -ifgrp a0b -port <PORT_C>
+network port ifgrp add-port -node <NODE2_NAME> -ifgrp a0b -port <PORT_D>
+
+# Set MTU on both ifgrps so VLAN children can inherit 9000
+network port modify -node <NODE1_NAME> -port a0a -mtu 9000
+network port modify -node <NODE1_NAME> -port a0b -mtu 9000
+network port modify -node <NODE2_NAME> -port a0a -mtu 9000
+network port modify -node <NODE2_NAME> -port a0b -mtu 9000
+
+# VLAN interfaces on both ifgrps
+vlan create -node <NODE1_NAME> -port a0a -vlan-id <MGMT_VLAN_ID>
+vlan create -node <NODE1_NAME> -port a0b -vlan-id <MGMT_VLAN_ID>
+vlan create -node <NODE2_NAME> -port a0a -vlan-id <MGMT_VLAN_ID>
+vlan create -node <NODE2_NAME> -port a0b -vlan-id <MGMT_VLAN_ID>
+vlan create -node <NODE1_NAME> -port a0a -vlan-id <NAS_VLAN_ID>
+vlan create -node <NODE1_NAME> -port a0b -vlan-id <NAS_VLAN_ID>
+vlan create -node <NODE2_NAME> -port a0a -vlan-id <NAS_VLAN_ID>
+vlan create -node <NODE2_NAME> -port a0b -vlan-id <NAS_VLAN_ID>
+vlan create -node <NODE1_NAME> -port a0a -vlan-id <SAN_VLAN_ID>
+vlan create -node <NODE1_NAME> -port a0b -vlan-id <SAN_VLAN_ID>
+vlan create -node <NODE2_NAME> -port a0a -vlan-id <SAN_VLAN_ID>
+vlan create -node <NODE2_NAME> -port a0b -vlan-id <SAN_VLAN_ID>
+vlan create -node <NODE1_NAME> -port a0a -vlan-id <ICL_VLAN_ID>
+vlan create -node <NODE1_NAME> -port a0b -vlan-id <ICL_VLAN_ID>
+vlan create -node <NODE2_NAME> -port a0a -vlan-id <ICL_VLAN_ID>
+vlan create -node <NODE2_NAME> -port a0b -vlan-id <ICL_VLAN_ID>
+
+# Assign tagged ports to broadcast domains -- both ifgrps participate
+network port broadcast-domain add-ports -ipspace Default -broadcast-domain mgmt \
+    -ports <NODE1_NAME>:a0a-<MGMT_VLAN_ID>,<NODE1_NAME>:a0b-<MGMT_VLAN_ID>,<NODE2_NAME>:a0a-<MGMT_VLAN_ID>,<NODE2_NAME>:a0b-<MGMT_VLAN_ID>
+network port broadcast-domain add-ports -ipspace Default -broadcast-domain icl \
+    -ports <NODE1_NAME>:a0a-<ICL_VLAN_ID>,<NODE1_NAME>:a0b-<ICL_VLAN_ID>,<NODE2_NAME>:a0a-<ICL_VLAN_ID>,<NODE2_NAME>:a0b-<ICL_VLAN_ID>
+network port broadcast-domain add-ports -ipspace Default -broadcast-domain nas \
+    -ports <NODE1_NAME>:a0a-<NAS_VLAN_ID>,<NODE1_NAME>:a0b-<NAS_VLAN_ID>,<NODE2_NAME>:a0a-<NAS_VLAN_ID>,<NODE2_NAME>:a0b-<NAS_VLAN_ID>
+network port broadcast-domain add-ports -ipspace Default -broadcast-domain san \
+    -ports <NODE1_NAME>:a0a-<SAN_VLAN_ID>,<NODE1_NAME>:a0b-<SAN_VLAN_ID>,<NODE2_NAME>:a0a-<SAN_VLAN_ID>,<NODE2_NAME>:a0b-<SAN_VLAN_ID>
+
+# Failover groups (both paths per node)
+network interface failover-groups create -vserver <CLUSTER_NAME> -failover-group fg-mgmt \
+    -targets <NODE1_NAME>:a0a-<MGMT_VLAN_ID>,<NODE1_NAME>:a0b-<MGMT_VLAN_ID>,<NODE2_NAME>:a0a-<MGMT_VLAN_ID>,<NODE2_NAME>:a0b-<MGMT_VLAN_ID>
+network interface failover-groups create -vserver <CLUSTER_NAME> -failover-group fg-icl \
+    -targets <NODE1_NAME>:a0a-<ICL_VLAN_ID>,<NODE1_NAME>:a0b-<ICL_VLAN_ID>,<NODE2_NAME>:a0a-<ICL_VLAN_ID>,<NODE2_NAME>:a0b-<ICL_VLAN_ID>
+
+### ===== END Option B ===== ###
+
+
+### CDP (Cisco Discovery Protocol) -- enable on every node ###
+# Confirms switch/port/vlan from the storage side once the switch sends
+# advertisements (typical 60s cycle).
+system node run -node * -command "options cdpd.enable on"
+
+# VERIFY:
+network port broadcast-domain show
+network port show -fields mtu,link,health-status
+network port show -fields flowcontrol-admin,flowcontrol-oper
+network port ifgrp show
+network port vlan show
+network interface failover-groups show
+network device-discovery show
+network device-discovery show -node *
+
+
+### Phase 5 -- Storage layout (aggregates + HA)
+##############################################################################
+### Data aggregates -- auto-provision ###
+# auto-provision picks the right RAID type, disk count, and spare allocation
+# for the platform automatically. Preview first (read-only), then apply.
+storage aggregate auto-provision -verbose
+storage aggregate auto-provision
+
+
+### Rename root aggregates (standardize to n<N>_aggr0 -- matches the LIF naming convention) ###
+# Must happen BEFORE Phase 6 SVM creation, since SVMs reference aggregates by name.
+storage aggregate rename -aggregate aggr0_<NODE1_NAME>_0 -newname n1_aggr0
+storage aggregate rename -aggregate aggr0_<NODE2_NAME>_0 -newname n2_aggr0
+
+
+### Enable HA and storage failover ###
+cluster ha modify -configured true
+storage failover modify -node * -enabled true
+storage failover modify -node * -auto-giveback true
+storage failover modify -node * -onreboot true
+
+# VERIFY:
+storage failover show
+cluster ha show
+
+
+### Phase 6 -- SVM: NAS (<NAS_SVM>) -- NFS + SMB/CIFS
+##############################################################################
+vserver create -vserver <NAS_SVM> -subtype default -rootvolume <NAS_SVM>_root \
+    -rootvolume-security-style mixed -language C.UTF-8 \
+    -snapshot-policy default -aggregate <NODE1_NAME>_aggr1
+# NAS root vol uses 'mixed' security style so NFS clients see UNIX perms and
+# CIFS clients see NTFS perms on the same SVM. (SAN SVM stays 'unix'.)
+vserver modify -vserver <NAS_SVM> -allowed-protocols nfs,cifs
+
+### Load-sharing mirrors for root volume on each node ###
+volume create -vserver <NAS_SVM> -volume <NAS_SVM>_root_m1 -aggregate <NODE1_NAME>_aggr1 \
+    -size 1g -type DP
+volume create -vserver <NAS_SVM> -volume <NAS_SVM>_root_m2 -aggregate <NODE2_NAME>_aggr1 \
+    -size 1g -type DP
+snapmirror create -source-path <CLUSTER_NAME>://<NAS_SVM>/<NAS_SVM>_root \
+    -destination-path <CLUSTER_NAME>://<NAS_SVM>/<NAS_SVM>_root_m1 -type LS \
+    -schedule hourly
+snapmirror create -source-path <CLUSTER_NAME>://<NAS_SVM>/<NAS_SVM>_root \
+    -destination-path <CLUSTER_NAME>://<NAS_SVM>/<NAS_SVM>_root_m2 -type LS \
+    -schedule hourly
+snapmirror initialize-ls-set -source-path <CLUSTER_NAME>://<NAS_SVM>/<NAS_SVM>_root
+
+### DNS on the SVM ###
+vserver services name-service dns create -vserver <NAS_SVM> \
+    -domains <AD_DOMAIN> -name-servers <DNS_SERVER_1>,<DNS_SERVER_2> -state enabled
+
+### NFS server (v3 + v4.1) + vstorage for VAAI ###
+vserver nfs create -vserver <NAS_SVM> -access true -v3 enabled -v4.1 enabled \
+    -vstorage enabled -v4-id-domain <AD_DOMAIN>
+# Idempotent re-assert of vstorage (required for VMware VAAI NFS Plug-in)
+vserver nfs modify -vserver <NAS_SVM> -vstorage enabled
+vserver nfs modify -vserver <NAS_SVM> -tcp-max-xfer-size 1048576
+
+### Tightened default export policy ###
+# The 'default' policy starts with NO rules -- LEAVE IT THAT WAY.
+# Create per-workload export policies and rules. Example:
+vserver export-policy create -vserver <NAS_SVM> -policyname vmware_nfs
+vserver export-policy rule create -vserver <NAS_SVM> -policyname vmware_nfs \
+    -clientmatch <CIDR_CLIENTS> -rorule sys -rwrule sys -superuser sys \
+    -anon 65534 -protocol nfs3,nfs41 -ruleindex 1
+
+### NAS data LIFs + default route -- REQUIRED before CIFS AD join ###
+# The CIFS create below performs an AD domain join at execution time. The SVM
+# must already have at least one data LIF up AND a route out, or the join will
+# fail (cannot reach DNS / cannot reach a domain controller).
+
+# NFS LIFs (one per node)
+network interface create -vserver <NAS_SVM> -lif n1_nfs_lif01 \
+    -service-policy default-data-files -address <NAS_LIF_1_IP> \
+    -netmask <NAS_MASK> -home-node <NODE1_NAME> \
+    -home-port a0a-<NAS_VLAN_ID> -status-admin up \
+    -failover-policy broadcast-domain-wide -auto-revert true
+network interface create -vserver <NAS_SVM> -lif n2_nfs_lif02 \
+    -service-policy default-data-files -address <NAS_LIF_2_IP> \
+    -netmask <NAS_MASK> -home-node <NODE2_NAME> \
+    -home-port a0a-<NAS_VLAN_ID> -status-admin up \
+    -failover-policy broadcast-domain-wide -auto-revert true
+
+# CIFS LIFs (one per node; same service-policy on ONTAP 9.13+)
+network interface create -vserver <NAS_SVM> -lif n1_cifs_lif01 \
+    -service-policy default-data-files -address <SMB_LIF_1_IP> \
+    -netmask <NAS_MASK> -home-node <NODE1_NAME> \
+    -home-port a0b-<NAS_VLAN_ID> -status-admin up \
+    -failover-policy broadcast-domain-wide -auto-revert true
+network interface create -vserver <NAS_SVM> -lif n2_cifs_lif02 \
+    -service-policy default-data-files -address <SMB_LIF_2_IP> \
+    -netmask <NAS_MASK> -home-node <NODE2_NAME> \
+    -home-port a0b-<NAS_VLAN_ID> -status-admin up \
+    -failover-policy broadcast-domain-wide -auto-revert true
+
+# NAS default route (needed for AD/DC reachability before CIFS join)
+network route create -vserver <NAS_SVM> -destination 0.0.0.0/0 -gateway <NAS_GW>
+
+### CIFS server with AD join + SMB hardening ###
+# AD admin creds are prompted; never put them in this file.
+vserver cifs create -vserver <NAS_SVM> -cifs-server <NAS_SVM> \
+    -domain <AD_DOMAIN> -ou "<AD_OU>" -status-admin up
+vserver cifs security modify -vserver <NAS_SVM> \
+    -is-signing-required true -is-smb-encryption-required true \
+    -kerberos-clock-skew 5 -is-aes-encryption-enabled true \
+    -lm-compatibility-level krb
+vserver cifs options modify -vserver <NAS_SVM> \
+    -is-advertise-dfs-enabled false -is-shadowcopy-enabled true \
+    -smb1-enabled-for-dc-connections false
+# Share defaults: enable Access-Based Enumeration globally on new shares
+vserver cifs share modify -vserver <NAS_SVM> -share-name admin$ \
+    -share-properties browsable    2>/dev/null || true
+
+# VERIFY:
+vserver show -vserver <NAS_SVM>
+vserver nfs show -vserver <NAS_SVM>
+vserver cifs show -vserver <NAS_SVM>
+vserver cifs security show -vserver <NAS_SVM>
+
+### Cluster admin login via Active Directory (requires <NAS_SVM> CIFS joined above) ###
+# Maps AD groups to ONTAP RBAC roles for cluster-admin SSH + HTTP login.
+# The domain tunnel uses the AD-joined <NAS_SVM> to authenticate cluster
+# administrators against Active Directory -- no per-user local accounts
+# required. Built-in roles: admin, readonly, autosupport, backup, none.
+security login domain-tunnel create -vserver <NAS_SVM>
+security login create -user-or-group-name "<AD_DOMAIN>\<AD_ADMIN_GROUP>" \
+    -application ssh  -authentication-method domain -role admin
+security login create -user-or-group-name "<AD_DOMAIN>\<AD_ADMIN_GROUP>" \
+    -application http -authentication-method domain -role admin
+security login create -user-or-group-name "<AD_DOMAIN>\<AD_RO_GROUP>" \
+    -application ssh  -authentication-method domain -role readonly
+
+# VERIFY:
+security login domain-tunnel show
+security login show -authentication-method domain
+
+
+### Phase 7 -- SVM: SAN (<SAN_SVM>) -- iSCSI + FCP
+##############################################################################
+vserver create -vserver <SAN_SVM> -subtype default -rootvolume <SAN_SVM>_root \
+    -rootvolume-security-style unix -language C.UTF-8 \
+    -snapshot-policy default -aggregate <NODE2_NAME>_aggr1
+vserver modify -vserver <SAN_SVM> -allowed-protocols iscsi,fcp
+
+### Load-sharing mirrors for the SAN SVM root volume ###
+# Protects against root-volume loss on either node. Same pattern as svm_nas.
+volume create -vserver <SAN_SVM> -volume <SAN_SVM>_root_m1 -aggregate <NODE1_NAME>_aggr1 \
+    -size 1g -type DP
+volume create -vserver <SAN_SVM> -volume <SAN_SVM>_root_m2 -aggregate <NODE2_NAME>_aggr1 \
+    -size 1g -type DP
+snapmirror create -source-path <CLUSTER_NAME>://<SAN_SVM>/<SAN_SVM>_root \
+    -destination-path <CLUSTER_NAME>://<SAN_SVM>/<SAN_SVM>_root_m1 -type LS \
+    -schedule hourly
+snapmirror create -source-path <CLUSTER_NAME>://<SAN_SVM>/<SAN_SVM>_root \
+    -destination-path <CLUSTER_NAME>://<SAN_SVM>/<SAN_SVM>_root_m2 -type LS \
+    -schedule hourly
+snapmirror initialize-ls-set -source-path <CLUSTER_NAME>://<SAN_SVM>/<SAN_SVM>_root
+
+### SAN data LIFs (iSCSI + FCP) ###
+# Create the LIFs FIRST so the iSCSI/FCP service create below has interfaces
+# to bind to. iSCSI LIFs have no failover -- MPIO on the host handles paths.
+network interface create -vserver <SAN_SVM> -lif n1_iscsi_lif01 \
+    -service-policy default-data-iscsi -address <ISCSI_LIF_1_IP> \
+    -netmask <SAN_MASK> -home-node <NODE1_NAME> \
+    -home-port a0a-<SAN_VLAN_ID> -status-admin up \
+    -failover-policy disabled -auto-revert false
+network interface create -vserver <SAN_SVM> -lif n2_iscsi_lif02 \
+    -service-policy default-data-iscsi -address <ISCSI_LIF_2_IP> \
+    -netmask <SAN_MASK> -home-node <NODE2_NAME> \
+    -home-port a0a-<SAN_VLAN_ID> -status-admin up \
+    -failover-policy disabled -auto-revert false
+
+# FCP LIFs (per FC target port; no IP). Adjust home-ports to your physical FC
+# adapters (e.g. 0e, 0f, 1a, 1b). Numbering is globally sequential.
+network interface create -vserver <SAN_SVM> -lif n1_fcp_lif01 \
+    -service-policy default-data-fcp -home-node <NODE1_NAME> -home-port <FC_PORT_A>
+network interface create -vserver <SAN_SVM> -lif n1_fcp_lif02 \
+    -service-policy default-data-fcp -home-node <NODE1_NAME> -home-port <FC_PORT_B>
+network interface create -vserver <SAN_SVM> -lif n2_fcp_lif03 \
+    -service-policy default-data-fcp -home-node <NODE2_NAME> -home-port <FC_PORT_A>
+network interface create -vserver <SAN_SVM> -lif n2_fcp_lif04 \
+    -service-policy default-data-fcp -home-node <NODE2_NAME> -home-port <FC_PORT_B>
+
+### iSCSI service ###
+vserver iscsi create -vserver <SAN_SVM> -target-alias <SAN_SVM>
+vserver iscsi modify -vserver <SAN_SVM> -status-admin up
+# CHAP example (per-initiator). Passwords are prompted.
+# vserver iscsi security create -vserver <SAN_SVM> -initiator <INITIATOR_IQN> \
+#     -auth-type CHAP -user-name <CHAP_USER> -outbound-user-name <CHAP_OUSER>
+
+### FCP service ###
+vserver fcp create -vserver <SAN_SVM>
+vserver fcp modify -vserver <SAN_SVM> -status-admin up
+# Capture target WWPNs to hand to the SAN team for zoning:
+vserver fcp portname show -vserver <SAN_SVM>
+
+### Example igroup (commented -- fill in per host) ###
+# lun igroup create -vserver <SAN_SVM> -igroup <HOST_NAME> -protocol iscsi \
+#     -ostype <vmware|windows|linux> -initiator <INITIATOR_IQN>
+# lun igroup create -vserver <SAN_SVM> -igroup <HOST_NAME>_fc -protocol fcp \
+#     -ostype <vmware|windows|linux> -initiator <HOST_WWPN_1>,<HOST_WWPN_2>
+
+# VERIFY:
+vserver show -vserver <SAN_SVM>
+vserver iscsi show
+vserver fcp show
+vserver fcp portname show -vserver <SAN_SVM>
+
+
+### Phase 9 -- Peer plumbing (intercluster LIFs + cluster-wide LIF verify)
+##############################################################################
+# Create intercluster LIFs so SnapMirror can be configured LATER.
+# We do NOT form the cluster peer here -- that requires the partner cluster.
+network interface create -vserver <CLUSTER_NAME> -lif n1_icl_lif01 \
+    -service-policy default-intercluster -address <ICL_LIF_1_IP> \
+    -netmask <ICL_MASK> -home-node <NODE1_NAME> \
+    -home-port a0a-<ICL_VLAN_ID> -status-admin up \
+    -failover-policy local-only -auto-revert true \
+    -failover-group fg-icl
+network interface create -vserver <CLUSTER_NAME> -lif n2_icl_lif02 \
+    -service-policy default-intercluster -address <ICL_LIF_2_IP> \
+    -netmask <ICL_MASK> -home-node <NODE2_NAME> \
+    -home-port a0a-<ICL_VLAN_ID> -status-admin up \
+    -failover-policy local-only -auto-revert true \
+    -failover-group fg-icl
+
+network route create -vserver <CLUSTER_NAME> -destination 0.0.0.0/0 -gateway <MGMT_GW>
+
+# VERIFY:
+network interface show -service-policy default-intercluster
+network ping -vserver <CLUSTER_NAME> -lif n1_icl_lif01 -destination <PEER_ICL_IP>
+# Cluster-wide LIF verify -- all data + intercluster LIFs should be up
+network interface show -fields vserver,lif,status-admin,status-oper,address,home-node,home-port,service-policy
+network interface show -role data -status-oper up
+
+# Future (commented): when peer cluster is built, generate peer passphrase
+# here and consume it on the partner. Run on BOTH clusters.
+#   cluster peer create -peer-addrs <PEER_ICL_IP_1>,<PEER_ICL_IP_2> \
+#       -ipspace Default
+#   cluster peer show
+#   vserver peer create -vserver <NAS_SVM> -peer-vserver <PEER_SVM> \
+#       -applications snapmirror -peer-cluster <PEER_CLUSTER_NAME>
+
+
+### Phase 10 -- Acceptance tests (must pass before handoff)
+##############################################################################
+### HA takeover / giveback (each node) ###
+storage failover takeover -ofnode <NODE2_NAME>
+# Wait until <NODE2_NAME> reports 'In takeover'
+storage failover show
+storage failover giveback -ofnode <NODE2_NAME>
+# Repeat in the other direction:
+storage failover takeover -ofnode <NODE1_NAME>
+storage failover show
+storage failover giveback -ofnode <NODE1_NAME>
+
+# VERIFY:
+storage failover show
+cluster show
+
+### LIF migration test (each data LIF) ###
+network interface migrate -vserver <NAS_SVM> -lif n1_nfs_lif01 \
+    -destination-node <NODE2_NAME> -destination-port a0a-<NAS_VLAN_ID>
+network interface show -lif n1_nfs_lif01
+network interface revert -vserver <NAS_SVM> -lif n1_nfs_lif01
+# Repeat for each data LIF.
+
+### Snapshot create / restore on a throwaway test volume ###
+volume create -vserver <NAS_SVM> -volume vol_test -aggregate <NODE1_NAME>_aggr1 \
+    -size 1g -policy default -snapshot-policy default -state online
+snapshot create -vserver <NAS_SVM> -volume vol_test -snapshot acceptance-pre
+# (simulate a change -- e.g. touch a file via mounted client)
+snapshot restore -vserver <NAS_SVM> -volume vol_test -snapshot acceptance-pre
+volume offline -vserver <NAS_SVM> -volume vol_test
+volume delete  -vserver <NAS_SVM> -volume vol_test
+
+### AutoSupport test message round-trip ###
+system node autosupport invoke -node * -type test -message "Acceptance test"
+system node autosupport history show -node * -destination http | head -10
+
+
+### Phase 11 -- Monitoring wiring
+##############################################################################
+### AutoSupport (HTTPS) + Active IQ ###
+# Configured here at the end so all hostnames, LIFs and services are in
+# place before the first real ASUP is sent.
+system node autosupport modify -node * -state enable -transport https \
+    -support enable -from <ASUP_FROM_EMAIL> -to <ASUP_TO_EMAIL> \
+    -mail-hosts <SMTP_RELAY> -hostnamesubj true
+system node autosupport modify -node * -enable-minimal true
+
+# Send a test message from each node
+system node autosupport invoke -node * -type test -message "Day-1 baseline test"
+
+# VERIFY:
+system node autosupport show -fields state,transport,support,is-minimal-enabled
+system node autosupport history show -node * -destination http
+system node autosupport check show
+# Active IQ portal will confirm receipt; add cluster at https://activeiq.netapp.com
+
+### Active IQ Unified Manager ###
+# From the AIQUM UI: Storage Management -> Clusters -> Add. Use the
+# cluster mgmt FQDN and the dedicated AIQUM service account (RBAC role:
+# admin or a custom monitoring role).
+
+### Syslog already added in Phase 2. Test: ###
+event log show -severity warning -time >1h
+
+### SNMPv3 user + traphost ###
+security login create -user-or-group-name snmpv3mon -application snmp \
+    -authentication-method usm -role readonly
+#   Auth/priv passwords are prompted; store in secret vault.
+system snmp traphost add -peer-address <SNMP_TRAP_TARGET>
+
+# VERIFY:
+system snmp show
+event config show
+
+### EMS critical event routing -> email + syslog ###
+event notification destination create -name ops-email -email <OPS_EMAIL>
+event notification create -filter-name important-events -destinations ops-email
+# Built-in filter 'important-events' covers ha.takeoverImpossible, disk fail, etc.
+event notification show
+
+
+### Phase 12 -- Handoff (evidence + sign-off)
+##############################################################################
+### Cluster config backup ###
+system configuration backup create -node <NODE1_NAME> -backup-type cluster \
+    -backup-name <CLUSTER_NAME>-day1-handoff
+system configuration backup show
+
+### Evidence bundle (paste each output into the handoff doc / save transcript) ###
+cluster show
+cluster ha show
+storage failover show
+storage aggregate show
+storage disk show -container-type spare
+network port broadcast-domain show
+network port ifgrp show
+network port vlan show
+network interface show -fields vserver,lif,status-oper,address,home-node,home-port,service-policy
+vserver show
+vserver nfs show
+vserver cifs show
+vserver iscsi show
+vserver fcp show
+security login show
+security key-manager onboard show
+security certificate show -type server
+system service-processor show -instance
+system node autosupport show
+system snmp show
+event notification show
+
+### Final sign-off checklist ###
+#   [ ] All Phase 10 acceptance tests passed
+#   [ ] Config backup pulled and stored in <BACKUP_LOCATION>
+#   [ ] OKM passphrase + breakglass password in secret vault
+#   [ ] Cluster registered in AIQUM and Active IQ
+#   [ ] CMDB / asset record updated with cluster + node serials
+#   [ ] Runbook handed off to ops on-call
+
+
+### Optional -- Hardening / Best Practices Add-Ons
+##############################################################################
+# The phases above produce a working, supported cluster. The items below
+# are recommended hardening steps that are commonly skipped during the
+# basic build -- either the customer hasn't decided, or the prerequisite
+# infrastructure (syslog server, etc.) is not yet in place.
+#
+# Ask the customer which of these to apply, then run them individually
+# AFTER Phase 12 sign-off. Each block is independent.
+
+### Service Processor admin password rotation + SSH allow-list ###
+# Restrict SP SSH to known admin networks first:
+system service-processor ssh add-allowed-addresses -allowed-addresses <ADMIN_CIDR>
+# Then SSH into each node's SP and rotate the default 'admin' password.
+# From the SP CLI on each node:
+#     user modify -username admin
+# (the new password is prompted; store it in the secret vault)
+
+# VERIFY:
+system service-processor ssh show
+system service-processor show -instance
+
+### Audit + cluster log forwarding to syslog ###
+# REQUIRES: a reachable syslog or SIEM endpoint (TLS-capable preferred).
+cluster log-forwarding create -destination <SYSLOG_SERVER> -port 6514 \
+    -protocol tcp-encrypted -facility user -verify-server true
+security audit modify -cliget on -ontapi on -http on
+
+# VERIFY:
+cluster log-forwarding show
+security audit log show | head -20
+
+
+### Appendix -- Workbook to Placeholder Cross-Reference
+##############################################################################
+# Source of values: <customer>-ONTAP_Workbook.xlsm (at the repo root).
+# Customer's filled-in workbook is the source of truth -- this table tells
+# you which sheet/column to copy each <PLACEHOLDER> from.
+#
+# Phase / Section          Workbook : Sheet / Column                  -> Placeholder
+# -----------------------------------------------------------------------------
+# Phase 1 (cluster)        Project Details : Cluster Name             -> <CLUSTER_NAME>
+# Phase 1 (cluster)        Project Details : Cluster IP or FQDN       -> <CLUSTER_FQDN>, <CLUSTER_MGMT_IP>
+# Phase 1 (cluster)        Project Details : Node N Name              -> <NODE1_NAME>, <NODE2_NAME>
+# Phase 1 (cluster)        NodeClusterInfo : ONTAP Version            -> (informational; informs IMT check)
+# Phase 1 (DNS/NTP)        Project Details : (Site networking block)  -> <DNS_SERVER_1/2>, <NTP_SERVER_1/2>, <AD_DOMAIN>, <TIMEZONE>
+# Phase 3 (SP)             NodeClusterInfo : (SP IP block)            -> <SP1_IP>, <SP2_IP>, <SP_MASK>, <SP_GW>
+# Phase 4 (network)        VLANs : Node, Port, VLAN ID                -> <NODE*_NAME>, <PORT_A..D>, <MGMT/NAS/SAN_VLAN_ID>
+# Phase 4 (network)        Broadcast Domains : Name, MTU, Ports       -> mgmt/nas/san/icl + MTU 1500/9000
+# Phase 4 (network)        IFGRP (lookup sheet)                       -> confirms mode multimode_lacp / distr-func IP
+# Phase 5 (aggregates)     Aggregates : Aggregate Name, Node          -> <NODE*_NAME>_aggr1 (auto-provision default)
+# Phase 5 (aggregates)     Aggregates : RAID Type, Disk Count         -> raidtype, diskcount (manual fallback only)
+# Phase 6 (SVM NAS)        SVMs : Name (NAS row)                      -> <NAS_SVM>
+# Phase 6 (SVM NAS)        SVMs : DNS Domains, DNS Servers            -> <AD_DOMAIN>, <DNS_SERVER_1/2>
+# Phase 6 (SVM NAS)        SVMs : Default Gateway                     -> <NAS_GW>
+# Phase 6 (SVM NAS)        SVMs : NFSv3 / NFSv4 / NFSv4.1 toggles     -> nfs create -v3 / -v4.1 flags
+# Phase 6 (CIFS)           CIFS Server : CIFS Server Name             -> cifs-server arg (e.g. svm-nas)
+# Phase 6 (CIFS)           CIFS Server : Domain, OU                   -> <AD_DOMAIN>, <AD_OU>
+# Phase 6 (Exports)        Export Policies : Policy Name              -> vmware_nfs (or per-workload name)
+# Phase 6 (Exports)        Export Policies : Client Match, RO/RW,
+#                            Protocol, Superuser, Anonymous UID       -> export-policy rule create args
+# Phase 6 (AD admin)       (operator-supplied -- not in workbook)     -> <AD_ADMIN_GROUP>, <AD_RO_GROUP>
+# Phase 7 (SVM SAN)        SVMs : Name (SAN row)                      -> <SAN_SVM>
+# Phase 8 (LIFs)           LIFs : Interface Name                      -> n<N>_<proto>_lif<NN> (suggested convention)
+# Phase 8 (LIFs)           LIFs : SVM                                 -> <NAS_SVM> or <SAN_SVM>
+# Phase 8 (LIFs)           LIFs : IP Address, Netmask                 -> <*_LIF_*_IP>, <NAS_MASK> / <SAN_MASK>
+# Phase 8 (LIFs)           LIFs : Home Node, Home Port                -> <NODE*_NAME>, a0a-<VLAN_ID> / <FC_PORT_*>
+# Phase 8 (LIFs)           LIFs : Service Policy                      -> default-data-files / -iscsi / -fcp
+# Phase 8 (LIFs)           LIFs : Failover Policy, Auto Revert        -> -failover-policy, -auto-revert
+# Phase 9 (peer)           (operator-supplied -- not in workbook)     -> <ICL_LIF_*_IP>, <ICL_MASK>, <PEER_ICL_IP>
+# Phase 11 (monitoring)    (operator-supplied)                        -> <ASUP_FROM/TO_EMAIL>, <SMTP_RELAY>,
+#                                                                       <SNMP_TRAP_TARGET>, <OPS_EMAIL>
+# Phase 12 (handoff)       (operator-supplied)                        -> <BACKUP_LOCATION>
+# Optional (syslog)        (operator-supplied)                        -> <SYSLOG_SERVER>
+# Optional (SP harden)     (operator-supplied)                        -> <ADMIN_CIDR>
+#
+# Workbook sheets BEYOND Day-1 scope (intentionally not addressed here;
+# these are typically post-handoff workload provisioning):
+#   Volumes, CIFS Shares, LUNs, iGroups (beyond the commented examples in
+#   Phase 7), ONTAP Features toggles (QoS, IPSpace, Advanced Routing).
+
+###############################################################################
+# END OF PLAYBOOK
+###############################################################################
